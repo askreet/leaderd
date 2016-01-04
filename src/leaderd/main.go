@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/dynamodb"
 	"log"
@@ -18,7 +19,7 @@ var region string
 var name string
 
 var interval int
-var timeout int
+var timeout int64
 
 var dynamo *dynamodb.DynamoDB
 
@@ -30,14 +31,28 @@ func main() {
 		os.Exit(1)
 	}
 
-	dynamo = dynamodb.New(session.New())
+	dynamo = dynamodb.New(session.New(&aws.Config{MaxRetries: aws.Int(0)}))
 
 	var currentLeader *CurrentLeader
 	var err error
 
+	var lastLeaderUpdate int64
+
 	for {
 		if leader == name {
-			updateLastUpdate()
+			err = updateLastUpdate()
+			if err != nil {
+				log.Print("Unable to update leader status.")
+				// If we haven't been able to update our status as leader in +timeout+
+				// seconds, stop assuming we are the leader.
+				if lastLeaderUpdate < time.Now().Unix()-timeout {
+					log.Printf("%d seconds since we last updated our leader status, assuming we lost leader role.", timeout)
+					leader = "unknown-leader"
+				}
+			} else {
+				// Keep track of when we last updated our status as leader.
+				lastLeaderUpdate = time.Now().Unix()
+			}
 		} else {
 			currentLeader, err = getCurrentLeader()
 
@@ -58,16 +73,16 @@ func main() {
 			if currentLeader.Name != name && currentLeader.LastUpdate <= time.Now().Unix()-int64(timeout) {
 				log.Printf("Attempting to steal leader from expired leader %s.", currentLeader.Name)
 				err = attemptToStealLeader()
-				if err != nil {
+				if err == nil {
 					log.Print("Success! This node is now the leader.")
 					leader = name
 				} else {
 					log.Printf("Error while stealing leadership role: %s", err)
 				}
 			}
-
-			time.Sleep(time.Duration(interval) * time.Second)
 		}
+
+		time.Sleep(time.Duration(interval) * time.Second)
 	}
 }
 
@@ -75,7 +90,7 @@ func parseArguments() error {
 	flag.StringVar(&table, "table", "", "dynamodb table to use")
 	flag.StringVar(&name, "name", "", "name for this node")
 	flag.IntVar(&interval, "interval", 10, "how often (seconds) to check if leader can be replaced, or to update leader timestamp if we are leader")
-	flag.IntVar(&timeout, "timeout", 60, "number of seconds before attempting to steal leader")
+	flag.Int64Var(&timeout, "timeout", 60, "number of seconds before attempting to steal leader")
 
 	flag.Parse()
 
@@ -103,6 +118,9 @@ func getCurrentLeader() (*CurrentLeader, error) {
 			"LockName": &dynamodb.AttributeValue{S: aws.String("Leader")},
 		},
 	})
+	if err != nil {
+		return nil, err
+	}
 
 	var lastUpdate int64
 	if val, ok := result.Item["LastUpdate"]; ok {
@@ -172,6 +190,9 @@ func updateLastUpdate() error {
 		},
 	})
 	if err != nil {
+		if awsErr, ok := err.(awserr.Error); ok {
+			log.Printf("Code=%s, Message=%s", awsErr.Code(), awsErr.Message())
+		}
 		// TODO: If the condition expression fails, we've lost our leadership.
 		// We'll have to convert this error and test for that failure.
 		log.Printf("updateLastUpdate(): %#v", err)
